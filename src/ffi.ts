@@ -74,15 +74,36 @@ const SYMBOLS = {
 // --- Type alias for the dynamic library type ---
 export type PtyLib = Deno.DynamicLibrary<typeof SYMBOLS>;
 
+let LIBRARY: PtyLib | undefined = undefined;
+
+/**
+ * Gets the instantiated library instance.
+ * @throws {Error} If the library has not been instantiated yet.
+ * @returns {PtyLib} The instantiated library.
+ */
+export function getLibrary(): PtyLib {
+  if (!LIBRARY) {
+    throw new Error("Library not instantiated. Call instantiate() first.");
+  }
+  return LIBRARY;
+}
+
 /**
  * Loads the native Pty library.
+ * @param {string} [libPath] - Optional path to the library file otherwise it will fetch released builds from GitHub.
+ * @throws {Error} If the library fails to load.
  */
-export async function instantiate(): Promise<PtyLib> {
+export async function instantiate(libPath?: string): Promise<void> {
+  if (libPath) {
+    LIBRARY = Deno.dlopen(libPath, SYMBOLS);
+    return;
+  }
+
   const name = "pty";
   const url =
     `https://github.com/sigmaSd/deno-pty-ffi/releases/download/${metadata.version}`;
 
-  return await plug.dlopen(
+  LIBRARY = await plug.dlopen(
     {
       name,
       url: Deno.env.get("RUST_LIB_PATH") || url,
@@ -101,4 +122,23 @@ export async function instantiate(): Promise<PtyLib> {
     },
     SYMBOLS,
   );
+}
+
+/**
+ * Utility function to get the library name depending on the OS.
+ * @returns {string} The name of the library.
+ */
+export function libName(): string {
+  switch (Deno.build.os) {
+    case "linux":
+      return `libpty_${Deno.build.arch}.so`;
+    case "darwin":
+      return `libpty_${
+        Deno.build.arch === "x86_64" ? "x86_64" : "arm64"
+      }.dylib`;
+    case "windows":
+      return "pty.dll";
+    default:
+      throw new Error(`Unsupported OS: ${Deno.build.os}`);
+  }
 }

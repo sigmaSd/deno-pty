@@ -1,4 +1,4 @@
-import { type CommandOptions, instantiate, type PtySize } from "./ffi.ts";
+import { type CommandOptions, getLibrary, type PtySize } from "./ffi.ts";
 import {
   decodeCString,
   decodePointerLenData,
@@ -9,10 +9,6 @@ import {
   readErrorAndFree, // Use the combined read+free for errors
   readPointerFromResultBuffer,
 } from "./utils.ts";
-
-// NOTE: consier exporting this, so the user decides when to instantiate
-// NOTE(2): The Libary should remain alive as long as the program is running
-const LIBRARY = await instantiate();
 
 // --- Result type for read operations ---
 /**
@@ -64,7 +60,7 @@ export class Pty {
     const resultPtrBuf = new BigUint64Array(1);
 
     // 3. Call FFI function: pty_create(cmd_ptr, cmd_len, result_ptr_buf) -> status
-    const status = LIBRARY.symbols.pty_create(
+    const status = getLibrary().symbols.pty_create(
       cmdDataPtr,
       BigInt(cmdData.length),
       resultPtrBuf, // Pass buffer for Rust to write result pointer into
@@ -73,7 +69,7 @@ export class Pty {
     // 4. Handle result
     if (status === -1) {
       // Error occurred, resultPtrBuf now contains pointer to error CString allocated by Rust
-      const errorMsg = readErrorAndFree(LIBRARY, resultPtrBuf);
+      const errorMsg = readErrorAndFree(getLibrary(), resultPtrBuf);
       throw new Error(`Pty creation failed: ${errorMsg}`);
     }
 
@@ -108,7 +104,7 @@ export class Pty {
     // Prepare buffer for Rust to write the result pointer (data CString* or error CString*)
     const resultPtrBuf = new BigUint64Array(1);
     // Call FFI: pty_read(pty_ptr, result_ptr_buf) -> status
-    const status = LIBRARY.symbols.pty_read(this.#ptr, resultPtrBuf);
+    const status = getLibrary().symbols.pty_read(this.#ptr, resultPtrBuf);
 
     switch (status) {
       case 0: { // Success, data available (or empty string)
@@ -126,7 +122,7 @@ export class Pty {
           return { data, done: false };
         } finally {
           // Free the CString memory allocated by Rust
-          freeRustString(LIBRARY, dataPtr);
+          freeRustString(getLibrary(), dataPtr);
         }
       }
       case 99: { // Special status code indicating the process has finished
@@ -140,12 +136,12 @@ export class Pty {
           this.#exitCode = Number.parseInt(exitCode);
           return { data: "", done: true };
         } finally {
-          freeRustString(LIBRARY, dataPtr);
+          freeRustString(getLibrary(), dataPtr);
         }
       }
       case -1: { // Error occurred
         // resultPtrBuf contains the error CString pointer
-        const errorMsg = readErrorAndFree(LIBRARY, resultPtrBuf);
+        const errorMsg = readErrorAndFree(getLibrary(), resultPtrBuf);
         throw new Error(`Pty read failed: ${errorMsg}`);
       }
       default:
@@ -175,15 +171,14 @@ export class Pty {
     const errorPtrBuf = new BigUint64Array(1);
 
     // Call FFI: pty_write(pty_ptr, data_cstr_ptr, error_ptr_buf) -> status
-    const status = LIBRARY.symbols.pty_write(
+    const status = getLibrary().symbols.pty_write(
       this.#ptr,
       dataCStr, // Pass pointer to the null-terminated CString data
       errorPtrBuf,
     );
 
     if (status === -1) {
-      // Error occurred, errorPtrBuf contains the error CString pointer
-      const errorMsg = readErrorAndFree(LIBRARY, errorPtrBuf);
+      const errorMsg = readErrorAndFree(getLibrary(), errorPtrBuf);
       throw new Error(`Pty write failed: ${errorMsg}`);
     }
     // Success (status == 0), nothing to return or clean up on the TS side
@@ -208,7 +203,7 @@ export class Pty {
     const errorPtrBuf = new BigUint64Array(1); // For *mut c_char (error CString pointer)
 
     // Call FFI: pty_get_size(pty_ptr, result_data_ptr_buf, result_len_buf, error_ptr_buf) -> status
-    const status = LIBRARY.symbols.pty_get_size(
+    const status = getLibrary().symbols.pty_get_size(
       this.#ptr,
       resultDataPtrBuf,
       resultLenBuf,
@@ -216,8 +211,7 @@ export class Pty {
     );
 
     if (status === -1) {
-      // Error occurred, errorPtrBuf contains the error CString pointer
-      const errorMsg = readErrorAndFree(LIBRARY, errorPtrBuf);
+      const errorMsg = readErrorAndFree(getLibrary(), errorPtrBuf);
       throw new Error(`Pty getSize failed: ${errorMsg}`);
     }
 
@@ -236,7 +230,7 @@ export class Pty {
       return size;
     } finally {
       // Free the raw data buffer allocated by Rust
-      freeRustData(LIBRARY, dataPtr, len);
+      freeRustData(getLibrary(), dataPtr, len);
     }
   }
 
@@ -263,7 +257,7 @@ export class Pty {
     const errorPtrBuf = new BigUint64Array(1);
 
     // Call FFI: pty_resize(pty_ptr, size_data_ptr, size_data_len, error_ptr_buf) -> status
-    const status = LIBRARY.symbols.pty_resize(
+    const status = getLibrary().symbols.pty_resize(
       this.#ptr,
       sizeDataPtr,
       BigInt(sizeData.length),
@@ -271,8 +265,7 @@ export class Pty {
     );
 
     if (status === -1) {
-      // Error occurred, errorPtrBuf contains the error CString pointer
-      const errorMsg = readErrorAndFree(LIBRARY, errorPtrBuf);
+      const errorMsg = readErrorAndFree(getLibrary(), errorPtrBuf);
       throw new Error(`Pty resize failed: ${errorMsg}`);
     }
     // Success (status == 0)
@@ -298,7 +291,7 @@ export class Pty {
       try {
         // Call the FFI function to drop the Pty struct on the Rust side
         // pty_close(pty_ptr) -> void (no return value, errors are exceptional)
-        LIBRARY.symbols.pty_close(ptrToClose);
+        getLibrary().symbols.pty_close(ptrToClose);
       } catch (e) {
         // Log error during close but keep marked as closed locally.
         // An error here might mean the Rust side panicked during drop.

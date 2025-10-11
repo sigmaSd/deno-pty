@@ -1,7 +1,10 @@
 {
   "name": "@sigma/pty-ffi",
   "version": "0.38.0",
-  "exports": "./mod.ts",
+  "exports": {
+    ".": "./mod.ts",
+    "./noinit": "./mod_noinit.ts"
+  },
   "tasks": {
     "build": "cargo build --manifest-path src-rust/Cargo.toml",
     "build:linux:x86_64": "deno task build && mv $CARGO_TARGET_DIR/debug/libpty.so $CARGO_TARGET_DIR/debug/libpty_$(uname -m).so",
