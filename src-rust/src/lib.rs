@@ -160,23 +160,51 @@ impl Pty {
         std::thread::spawn(move || {
             // Reasonably sized buffer
             let mut buf = vec![0u8; 8 * 1024]; // 8KB buffer
+            // Incomplete UTF-8 tail carried over from the previous read. A read
+            // can end mid-codepoint (multi-byte chars split at the buffer
+            // boundary — guaranteed under heavy CJK/emoji/TUI output), which is
+            // not an error: prepend the tail to the next chunk and decode then.
+            let mut pending: Vec<u8> = Vec::new();
             // TODO: surface the errors back to the user instead of printing
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF
                     Ok(n) => {
-                        match String::from_utf8(buf[..n].to_vec()) {
+                        let mut bytes = std::mem::take(&mut pending);
+                        bytes.extend_from_slice(&buf[..n]);
+                        match String::from_utf8(bytes) {
                             Ok(data) => {
                                 if tx_read_reader_thread.send(Message::Data(data)).is_err() {
                                     break; // Receiver disconnected
                                 }
                             }
                             Err(e) => {
-                                // Handle non-UTF8 data? Log or send specific error?
-                                // For now, let's log it and stop reading.
-                                eprintln!("PTY read non-UTF8 data: {}", e);
-                                // Maybe send an error message? For now, just break.
-                                break;
+                                let valid_up_to = e.utf8_error().valid_up_to();
+                                let error_len = e.utf8_error().error_len();
+                                let bytes = e.into_bytes();
+                                if error_len.is_none() {
+                                    // Incomplete sequence at the very end of the
+                                    // chunk (≤3 bytes): emit the valid prefix and
+                                    // carry the tail into the next read.
+                                    if valid_up_to > 0 {
+                                        // SAFETY: from_utf8 validated everything below valid_up_to.
+                                        let data = unsafe {
+                                            String::from_utf8_unchecked(bytes[..valid_up_to].to_vec())
+                                        };
+                                        if tx_read_reader_thread.send(Message::Data(data)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    pending = bytes[valid_up_to..].to_vec();
+                                } else {
+                                    // Genuinely invalid bytes mid-stream (binary
+                                    // output): decode lossily and keep reading
+                                    // rather than killing the terminal.
+                                    let data = String::from_utf8_lossy(&bytes).into_owned();
+                                    if tx_read_reader_thread.send(Message::Data(data)).is_err() {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
