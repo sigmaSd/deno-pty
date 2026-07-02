@@ -18,7 +18,6 @@ jobs:
           ubuntu-latest,
           ubuntu-24.04-arm,
           windows-latest,
-          macos-13,
           macos-latest,
         ]
 
@@ -29,10 +28,19 @@ jobs:
       - name: Build
         run: cargo build --release --manifest-path src-rust/Cargo.toml
 
-      - name: Correct MacOS lib name
+      # macos-13 (the last free Intel runner) is retired — cross-compile
+      # x86_64 from the arm64 runner instead so both mac archs ship.
+      - name: Cross-compile MacOS x86_64 lib
+        if: runner.os == 'MacOS'
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo build --release --manifest-path src-rust/Cargo.toml --target x86_64-apple-darwin
+
+      - name: Correct MacOS lib names
         if: runner.os == 'MacOS'
         run: |
           mv src-rust/target/release/libpty.dylib libpty_$(uname -m).dylib
+          mv src-rust/target/x86_64-apple-darwin/release/libpty.dylib libpty_x86_64.dylib
 
       - name: Upload MacOS lib
         if: runner.os == 'MacOS'
