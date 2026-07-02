@@ -4,7 +4,7 @@ use portable_pty::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::{CString, c_char},
     io::Read,
     mem::forget,
@@ -32,12 +32,42 @@ pub struct Pty {
 struct PtyReader {
     rx_read: Receiver<Message>,
     exit_status: Cell<Option<u32>>,
+    /// Incomplete UTF-8 tail carried between string-API reads. A chunk can end
+    /// mid-codepoint (guaranteed under heavy CJK/emoji/TUI output); the tail
+    /// (at most 3 bytes) is prepended to the next read before decoding.
+    pending_utf8: RefCell<Vec<u8>>,
 }
 impl PtyReader {
     fn new(rx_read: Receiver<Message>) -> PtyReader {
         Self {
             rx_read,
             exit_status: Cell::new(None),
+            pending_utf8: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Decode bytes as UTF-8 for the string API, carrying an incomplete
+    /// trailing sequence into the next call instead of erroring. Genuinely
+    /// invalid bytes mid-stream (binary output) decode lossily.
+    fn decode_utf8_carry(&self, bytes: Vec<u8>) -> String {
+        let mut pending = self.pending_utf8.borrow_mut();
+        let mut all = std::mem::take(&mut *pending);
+        all.extend_from_slice(&bytes);
+        match String::from_utf8(all) {
+            Ok(s) => s,
+            Err(e) => {
+                let valid_up_to = e.utf8_error().valid_up_to();
+                let error_len = e.utf8_error().error_len();
+                let all = e.into_bytes();
+                if error_len.is_none() {
+                    // Incomplete sequence at the very end: keep the tail.
+                    *pending = all[valid_up_to..].to_vec();
+                    // SAFETY: from_utf8 validated everything below valid_up_to.
+                    unsafe { String::from_utf8_unchecked(all[..valid_up_to].to_vec()) }
+                } else {
+                    String::from_utf8_lossy(&all).into_owned()
+                }
+            }
         }
     }
     //NOTE: this function should not block
@@ -75,21 +105,17 @@ impl PtyReader {
         // msgs is empty but we didn't receive End Message
         if msgs.is_empty() {
             // No data, no end signal yet
-            return Ok(Message::Data("".to_string()));
+            return Ok(Message::Data(Vec::new()));
         }
 
-        let combined_data = msgs
-            .iter()
-            .map(|msg| {
-                // Use filter_map to handle potential non-Data variants safely
-                if let Message::Data(data) = msg {
-                    data.as_str()
-                } else {
-                    unreachable!("we already filtered End messages")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("");
+        let mut combined_data: Vec<u8> = Vec::new();
+        for msg in &msgs {
+            if let Message::Data(data) = msg {
+                combined_data.extend_from_slice(data);
+            } else {
+                unreachable!("we already filtered End messages")
+            }
+        }
 
         Ok(Message::Data(combined_data))
     }
@@ -105,7 +131,7 @@ struct Command {
 
 #[derive(PartialEq, Eq, Debug, Clone)]
 enum Message {
-    Data(String),
+    Data(Vec<u8>),
     End(u32),
 }
 
@@ -160,52 +186,18 @@ impl Pty {
         std::thread::spawn(move || {
             // Reasonably sized buffer
             let mut buf = vec![0u8; 8 * 1024]; // 8KB buffer
-            // Incomplete UTF-8 tail carried over from the previous read. A read
-            // can end mid-codepoint (multi-byte chars split at the buffer
-            // boundary — guaranteed under heavy CJK/emoji/TUI output), which is
-            // not an error: prepend the tail to the next chunk and decode then.
-            let mut pending: Vec<u8> = Vec::new();
-            // TODO: surface the errors back to the user instead of printing
+            // The reader is a byte pipe: no decoding here. UTF-8 handling
+            // (incl. chunk boundaries splitting a codepoint) happens at the
+            // string API (`decode_utf8_carry`); the bytes API forwards raw.
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF
                     Ok(n) => {
-                        let mut bytes = std::mem::take(&mut pending);
-                        bytes.extend_from_slice(&buf[..n]);
-                        match String::from_utf8(bytes) {
-                            Ok(data) => {
-                                if tx_read_reader_thread.send(Message::Data(data)).is_err() {
-                                    break; // Receiver disconnected
-                                }
-                            }
-                            Err(e) => {
-                                let valid_up_to = e.utf8_error().valid_up_to();
-                                let error_len = e.utf8_error().error_len();
-                                let bytes = e.into_bytes();
-                                if error_len.is_none() {
-                                    // Incomplete sequence at the very end of the
-                                    // chunk (≤3 bytes): emit the valid prefix and
-                                    // carry the tail into the next read.
-                                    if valid_up_to > 0 {
-                                        // SAFETY: from_utf8 validated everything below valid_up_to.
-                                        let data = unsafe {
-                                            String::from_utf8_unchecked(bytes[..valid_up_to].to_vec())
-                                        };
-                                        if tx_read_reader_thread.send(Message::Data(data)).is_err() {
-                                            break;
-                                        }
-                                    }
-                                    pending = bytes[valid_up_to..].to_vec();
-                                } else {
-                                    // Genuinely invalid bytes mid-stream (binary
-                                    // output): decode lossily and keep reading
-                                    // rather than killing the terminal.
-                                    let data = String::from_utf8_lossy(&bytes).into_owned();
-                                    if tx_read_reader_thread.send(Message::Data(data)).is_err() {
-                                        break;
-                                    }
-                                }
-                            }
+                        if tx_read_reader_thread
+                            .send(Message::Data(buf[..n].to_vec()))
+                            .is_err()
+                        {
+                            break; // Receiver disconnected
                         }
                     }
                     Err(e) => {
@@ -324,7 +316,8 @@ pub unsafe extern "C" fn pty_create(
 pub unsafe extern "C" fn pty_read(pty_ptr: *mut Pty, result_ptr: *mut usize) -> i8 {
     let pty = unsafe { &*pty_ptr };
     match pty.read() {
-        Ok(Message::Data(data)) => {
+        Ok(Message::Data(bytes)) => {
+            let data = pty.reader.decode_utf8_carry(bytes);
             match CString::new(data) {
                 // Handles potential null bytes in data
                 Ok(c_string) => {
@@ -347,6 +340,57 @@ pub unsafe extern "C" fn pty_read(pty_ptr: *mut Pty, result_ptr: *mut usize) -> 
         Err(err) => {
             unsafe { *result_ptr = boxed_error_to_cstring(err).into_raw() as _ };
             -1 // Error
+        }
+    }
+}
+
+
+/// Reads pending PTY output as RAW BYTES (no UTF-8 decoding).
+///
+/// `result_ptr` must point to a buffer of TWO usize slots:
+/// - status `0`:  slot0 = data pointer (or null if no data), slot1 = length in
+///   bytes. Free with `free_data(ptr, len)`. A null pointer with length 0 just
+///   means "no data available right now".
+/// - status `99`: process exited; slot0 = exit code, slot1 = 0.
+/// - status `-1`: error; slot0 = error CString pointer (free with
+///   `free_string`), slot1 = 0.
+///
+/// Unlike `pty_read`, chunk boundaries splitting a UTF-8 codepoint are the
+/// caller's concern (e.g. decode with a streaming TextDecoder), and interior
+/// NUL bytes in the stream are passed through instead of erroring.
+///
+/// # Safety
+/// - `pty_ptr` must be a valid pointer obtained from `pty_create`.
+/// - `result_ptr` must point to a writable buffer of at least 2 usize values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pty_read_bytes(pty_ptr: *mut Pty, result_ptr: *mut usize) -> i8 {
+    let pty = unsafe { &*pty_ptr };
+    let out = unsafe { slice::from_raw_parts_mut(result_ptr, 2) };
+    match pty.read() {
+        Ok(Message::Data(mut bytes)) => {
+            if bytes.is_empty() {
+                out[0] = 0;
+                out[1] = 0;
+                return 0;
+            }
+            bytes.shrink_to_fit();
+            debug_assert_eq!(bytes.len(), bytes.capacity());
+            let len = bytes.len();
+            let ptr = bytes.as_mut_ptr();
+            forget(bytes);
+            out[0] = ptr as usize;
+            out[1] = len;
+            0
+        }
+        Ok(Message::End(code)) => {
+            out[0] = code as usize;
+            out[1] = 0;
+            99
+        }
+        Err(err) => {
+            out[0] = boxed_error_to_cstring(err).into_raw() as usize;
+            out[1] = 0;
+            -1
         }
     }
 }
@@ -574,7 +618,7 @@ mod tests {
                             let r = reader.read().unwrap();
                             match r {
                                 Message::Data(data) => {
-                                    if data.contains(expect) {
+                                    if String::from_utf8_lossy(&data).contains(expect) {
                                         tx.send(Ok(())).unwrap();
                                         break;
                                     }
