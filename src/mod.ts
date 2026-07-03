@@ -151,6 +151,59 @@ export class Pty {
   }
 
   /**
+   * Reads pending output from the PTY as RAW BYTES, without UTF-8 decoding.
+   *
+   * Unlike {@linkcode Pty.read}, chunk boundaries that split a multi-byte
+   * UTF-8 codepoint are the caller's concern — decode with a streaming
+   * decoder (`new TextDecoder(undefined, { fatal: false })` +
+   * `decode(bytes, { stream: true })`) or hand the bytes to a consumer that
+   * decodes itself (e.g. xterm.js `Terminal.write(Uint8Array)`). Interior
+   * NUL bytes in the stream are passed through instead of erroring.
+   *
+   * Non-blocking: returns `{ data: empty, done: false }` when nothing is
+   * pending.
+   *
+   * @returns The bytes read (empty when none) and whether the process ended.
+   * @throws {Error} If the Pty has already been closed (`close()` was called).
+   * @throws {Error} If the underlying FFI call fails.
+   */
+  readBytes(): { data: Uint8Array; done: boolean } {
+    if (!this.#ptr) throw new Error("Pty is closed.");
+
+    // Two usize slots: [data_ptr, len] | [exit_code, 0] | [err_cstr_ptr, 0]
+    const out = new BigUint64Array(2);
+    const status = getLibrary().symbols.pty_read_bytes(this.#ptr, out);
+
+    switch (status) {
+      case 0: {
+        const len = Number(out[1]);
+        const ptr = Deno.UnsafePointer.create(out[0]);
+        if (!ptr || len === 0) {
+          return { data: new Uint8Array(0), done: false };
+        }
+        try {
+          const data = new Uint8Array(len);
+          new Deno.UnsafePointerView(ptr).copyInto(data);
+          return { data, done: false };
+        } finally {
+          getLibrary().symbols.free_data(ptr, BigInt(len));
+        }
+      }
+      case 99: {
+        this.#exitCode = Number(out[0]);
+        return { data: new Uint8Array(0), done: true };
+      }
+      case -1: {
+        const errPtrBuf = new BigUint64Array([out[0]]);
+        const errorMsg = readErrorAndFree(getLibrary(), errPtrBuf);
+        throw new Error(`Pty readBytes failed: ${errorMsg}`);
+      }
+      default:
+        throw new Error(`Pty readBytes returned unexpected status: ${status}`);
+    }
+  }
+
+  /**
    * Writes the given data (as a string) to the PTY's input (master file descriptor).
    * This data is typically forwarded to the standard input of the child process.
    * The string is encoded as a null-terminated C string before being passed to the FFI.

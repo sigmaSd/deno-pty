@@ -17,6 +17,29 @@ for await (const line of pty.readable) {
 }
 ```
 
+### Raw bytes API
+
+For high-throughput consumers (terminals, proxies) read raw bytes and let the
+consumer decode. Unlike the string API, interior NUL bytes pass through, and
+chunk boundaries splitting a UTF-8 codepoint are the decoder's concern:
+
+```ts
+import { Pty } from "jsr:@sigma/pty-ffi";
+
+const pty = new Pty("bash");
+const decoder = new TextDecoder();
+while (true) {
+  const { data, done } = pty.readBytes();
+  if (done) break;
+  if (data.byteLength) {
+    // or: term.write(data) — xterm.js decodes (and handles split codepoints) itself
+    console.log(decoder.decode(data, { stream: true }));
+  } else {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+```
+
 You can also use noinit module, this module expects the user to initialize the
 library before using it. (uesful when using deno compile or when wanting to
 defer initialization)
