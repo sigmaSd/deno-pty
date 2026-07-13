@@ -11,6 +11,13 @@ export interface CommandOptions {
   env?: Record<string, string>;
   /** The working directory for the command. defaults to the current working directory. */
   cwd?: string;
+  /**
+   * The initial terminal size. The pty is opened at this size, so the child
+   * process never observes the default 80x24 grid — spawning at the real size
+   * avoids the resize race where a shell prints its first prompt at 80
+   * columns and reflows it once a later `resize()` lands. Defaults to 80x24.
+   */
+  size?: PtySize;
 }
 
 /**

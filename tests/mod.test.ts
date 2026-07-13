@@ -99,6 +99,32 @@ Deno.test("getSize/resize", () => {
   pty.close();
 });
 
+Deno.test("spawn size", () => {
+  // The pty opens at the requested size — the child never observes the
+  // default 80x24 grid, so there is no spawn-then-resize race.
+  const pty = new Pty(
+    Deno.build.os === "windows" ? "cmd" : "echo",
+    {
+      args: ["hello"],
+      size: { rows: 33, cols: 61 },
+    },
+  );
+  const size = pty.getSize();
+  assertEquals(size.rows, 33);
+  assertEquals(size.cols, 61);
+  pty.close();
+
+  // Without a size the default grid stays 80x24.
+  const def = new Pty(
+    Deno.build.os === "windows" ? "cmd" : "echo",
+    { args: ["hello"] },
+  );
+  const defSize = def.getSize();
+  assertEquals(defSize.rows, 24);
+  assertEquals(defSize.cols, 80);
+  def.close();
+});
+
 Deno.test("with cwd set", async () => {
   const tmpDir = await Deno.makeTempDir();
   const testFileName = "pty_cwd_test_file.txt";

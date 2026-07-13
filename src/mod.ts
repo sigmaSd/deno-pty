@@ -51,7 +51,15 @@ export class Pty {
    */
   constructor(command: string, options: CommandOptions = {}) {
     // 1. Encode command using pointer + length (bincode serialization)
-    const rustCommand = { cmd: command, ...options };
+    // Rust's PtySize deserializes all fields, so fill the optional pixel
+    // dimensions like resize() does.
+    const rustCommand = {
+      cmd: command,
+      ...options,
+      ...(options.size
+        ? { size: { pixel_width: 0, pixel_height: 0, ...options.size } }
+        : {}),
+    };
     const cmdData = encodePointerLenData(rustCommand);
     const cmdDataPtr = Deno.UnsafePointer.of(cmdData); // Get pointer TO the TS buffer containing serialized data
 

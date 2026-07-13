@@ -127,6 +127,7 @@ struct Command {
     args: Option<Vec<String>>,
     env: Option<std::collections::HashMap<String, String>>,
     cwd: Option<String>,
+    size: Option<PtySize>,
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -138,12 +139,16 @@ enum Message {
 impl Pty {
     fn create(command: Command) -> Result<Self> {
         let pty_system = native_pty_system();
-        let pair = pty_system.openpty(PtySize {
+        // Open at the requested size so the child never observes the default
+        // grid: with a spawn-then-resize dance the shell can win the race and
+        // print its first prompt at 80 cols, which reflows into stray blank
+        // lines once the real size lands.
+        let pair = pty_system.openpty(command.size.unwrap_or(PtySize {
             rows: 24,
             cols: 80,
             pixel_width: 0,
             pixel_height: 0,
-        })?;
+        }))?;
 
         let mut cmd_builder = CommandBuilder::new(command.cmd);
         // https://github.com/wez/wezterm/issues/4205
@@ -591,6 +596,32 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
+
+    #[test]
+    fn spawn_size() {
+        let pty = Pty::create(Command {
+            cmd: if cfg!(windows) { "cmd" } else { "echo" }.into(),
+            args: Some(vec!["hello".into()]),
+            env: None,
+            cwd: None,
+            size: Some(PtySize {
+                rows: 33,
+                cols: 61,
+                pixel_width: 0,
+                pixel_height: 0,
+            }),
+        })
+        .unwrap();
+        assert!(matches!(
+            pty.get_size(),
+            Ok(PtySize {
+                rows: 33,
+                cols: 61,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn it_works() {
         let mut threads = vec![];
@@ -601,6 +632,7 @@ mod tests {
                     args: Some(vec!["repl".into()]),
                     env: Some([("NO_COLOR".into(), "1".into())].into()),
                     cwd: None,
+                    size: None,
                 })
                 .unwrap();
 
