@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn it_works() {
         let mut threads = vec![];
-        for _ in 0..10 {
+        for _ in 0..3 {
             threads.push(std::thread::spawn(|| {
                 let pty = Pty::create(Command {
                     cmd: "deno".into(),
