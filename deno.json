@@ -1,6 +1,6 @@
 {
   "name": "@sigma/pty-ffi",
-  "version": "0.41.0",
+  "version": "0.42.0",
   "exports": {
     ".": "./mod.ts",
     "./noinit": "./mod_noinit.ts"
