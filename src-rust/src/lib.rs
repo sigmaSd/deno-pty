@@ -136,6 +136,52 @@ enum Message {
     End(u32),
 }
 
+#[cfg(windows)]
+struct CursorQueryWatcher {
+    tail: Vec<u8>,
+}
+
+#[cfg(windows)]
+impl CursorQueryWatcher {
+    const QUERY: &'static [u8] = b"\x1b[6n";
+    const RESPONSE: &'static str = "\x1b[1;1R";
+
+    fn new() -> Self {
+        Self { tail: Vec::new() }
+    }
+
+    fn scan_and_strip(&mut self, chunk: &[u8]) -> (Vec<u8>, usize) {
+        let mut buf = std::mem::take(&mut self.tail);
+        buf.extend_from_slice(chunk);
+
+        let mut cleaned = Vec::with_capacity(buf.len());
+        let mut count = 0;
+        let mut i = 0;
+        while i < buf.len() {
+            if buf[i..].len() >= Self::QUERY.len() && &buf[i..i + Self::QUERY.len()] == Self::QUERY
+            {
+                count += 1;
+                i += Self::QUERY.len();
+            } else {
+                cleaned.push(buf[i]);
+                i += 1;
+            }
+        }
+
+        let keep = Self::QUERY.len() - 1;
+        let check_from = cleaned.len().saturating_sub(keep);
+        let mut split_at = cleaned.len();
+        for start in check_from..cleaned.len() {
+            if Self::QUERY.starts_with(&cleaned[start..]) {
+                split_at = start;
+                break;
+            }
+        }
+        self.tail = cleaned.split_off(split_at);
+        (cleaned, count)
+    }
+}
+
 impl Pty {
     fn create(command: Command) -> Result<Self> {
         let pty_system = native_pty_system();
@@ -182,49 +228,57 @@ impl Pty {
             let _ = tx_read_c.send(Message::End(exit_code));
         });
 
-        // Read the output in another thread.
-        // This is important because it is easy to encounter a situation
-        // where read/write buffers fill and block either your process
-        // or the spawned process.
-        let mut reader = pair.master.try_clone_reader()?;
-        let tx_read_reader_thread = tx_read.clone();
-        std::thread::spawn(move || {
-            // Reasonably sized buffer
-            let mut buf = vec![0u8; 8 * 1024]; // 8KB buffer
-            // The reader is a byte pipe: no decoding here. UTF-8 handling
-            // (incl. chunk boundaries splitting a codepoint) happens at the
-            // string API (`decode_utf8_carry`); the bytes API forwards raw.
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        if tx_read_reader_thread
-                            .send(Message::Data(buf[..n].to_vec()))
-                            .is_err()
-                        {
-                            break; // Receiver disconnected
-                        }
-                    }
-                    Err(e) => {
-                        // Differentiate between temporary errors and fatal ones if possible
-                        eprintln!("Error reading from PTY: {}", e);
-                        break; // Stop reading on error
-                    }
-                }
-            }
-            // if we got here, it means that probably the process have exited, and the end message have been sent
-            // NOTE: is this correct ?
-        });
-
         // Thread for writing to PTY input
         let mut writer = pair.master.take_writer()?;
         let (tx_write, rx_write): (Sender<String>, _) = unbounded();
         std::thread::spawn(move || {
             while let Ok(data_to_write) = rx_write.recv() {
                 if writer.write_all(data_to_write.as_bytes()).is_err() {
-                    // Log error, maybe signal failure?
                     eprintln!("Error writing to PTY");
-                    break; // Stop trying to write
+                    break;
+                }
+            }
+        });
+
+        // Read the output in another thread.
+        // This is important because it is easy to encounter a situation
+        // where read/write buffers fill and block either your process
+        // or the spawned process.
+        let mut reader = pair.master.try_clone_reader()?;
+        let tx_read_reader_thread = tx_read.clone();
+        #[cfg(windows)]
+        let tx_write_for_cursor = tx_write.clone();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 8 * 1024];
+            #[cfg(windows)]
+            let mut cursor_watcher = CursorQueryWatcher::new();
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        #[cfg(windows)]
+                        let forward = {
+                            let (cleaned, queries) = cursor_watcher.scan_and_strip(&buf[..n]);
+                            for _ in 0..queries {
+                                let _ = tx_write_for_cursor
+                                    .send(CursorQueryWatcher::RESPONSE.to_string());
+                            }
+                            cleaned
+                        };
+                        #[cfg(not(windows))]
+                        let forward = buf[..n].to_vec();
+
+                        if forward.is_empty() {
+                            continue;
+                        }
+                        if tx_read_reader_thread.send(Message::Data(forward)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading from PTY: {}", e);
+                        break;
+                    }
                 }
             }
         });

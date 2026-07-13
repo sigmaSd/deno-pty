@@ -13,10 +13,11 @@
     "lint": "deno lint && cargo clippy --manifest-path src-rust/Cargo.toml",
     "test": "deno task test:rust && deno task test:deno",
     "test:rust": "cargo test --manifest-path src-rust/Cargo.toml",
-    "test:deno": "deno task build && export RUST_LIB_PATH=$CARGO_TARGET_DIR/debug && deno test -A"
+    "test:deno": "deno task build && export RUST_LIB_PATH=$CARGO_TARGET_DIR/debug && deno test -A",
+    "upgrade": "deno update --latest && cargo upgrade --manifest-path src-rust/Cargo.toml --incompatible"
   },
   "imports": {
-    "@denosaurs/plug": "jsr:@denosaurs/plug@1.0.6",
-    "@std/assert": "jsr:@std/assert@^1.0.14"
+    "@denosaurs/plug": "jsr:@denosaurs/plug@1.1.0",
+    "@std/assert": "jsr:@std/assert@^1.0.19"
   }
 }
