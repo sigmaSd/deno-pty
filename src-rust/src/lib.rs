@@ -228,7 +228,9 @@ impl Pty {
             let _ = tx_read_c.send(Message::End(exit_code));
         });
 
-        // Thread for writing to PTY input
+        // Writer thread must be created before the reader thread so tx_write
+        // is available to clone into the reader closure for replying to ConPTY
+        // cursor-position queries on Windows (see CursorQueryWatcher).
         let mut writer = pair.master.take_writer()?;
         let (tx_write, rx_write): (Sender<String>, _) = unbounded();
         std::thread::spawn(move || {
@@ -249,7 +251,11 @@ impl Pty {
         #[cfg(windows)]
         let tx_write_for_cursor = tx_write.clone();
         std::thread::spawn(move || {
-            let mut buf = vec![0u8; 8 * 1024];
+            // Reasonably sized buffer
+            let mut buf = vec![0u8; 8 * 1024]; // 8KB buffer
+            // The reader is a byte pipe: no decoding here. UTF-8 handling
+            // (incl. chunk boundaries splitting a codepoint) happens at the
+            // string API (`decode_utf8_carry`); the bytes API forwards raw.
             #[cfg(windows)]
             let mut cursor_watcher = CursorQueryWatcher::new();
             loop {
